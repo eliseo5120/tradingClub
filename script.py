@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot de trading por Telegram para Binance USDⓈ-M Futures Demo.
+"""Bot de trading por Telegram para Binance USDⓈ-M Futures en Hedge Mode.
 
-- Una sola aplicación Python; configuración/operaciones se guardan en JSON.
-- Lee de señales SOLO símbolo */USDT, BUY/SELL y rango. Ignora TP/SL/leverage.
-- Conserva perfiles y reglas de rango del Excel del usuario.
-- Coloca entradas LIMIT y, tras cada fill confirmado, coloca la LIMIT parcial;
-  un único TRAILING_STOP_MARKET agregado protege la posición restante.
-- Host fijado a Binance Futures Demo; nunca conecta a producción.
+- Una sola aplicación Python; datos persistentes en trading_bot_data.json.
+- Lee de señales solo símbolo, BUY/SELL y rango; ignora TP/SL/leverage del mensaje.
+- Conserva perfiles y extensiones de rango del Excel del usuario.
+- BTC/ETH: leverage fijo 100x, Stop Loss editable (por defecto -300% ROI).
+- Altcoins: leverage seleccionable 20x-30x y Stop Loss editable 80%-120% ROI.
+- Stop de todos los perfiles desde el promedio ponderado: ROI / leverage / 100.
+- Coloca entradas LIMIT; tras cada fill coloca LIMIT parcial y mantiene un
+  STOP_MARKET de protección de la pata más un TRAILING_STOP_MARKET agregado.
+- DEMO por defecto; LIVE requiere ALLOW_LIVE_TRADING=YES y confirmación por Telegram.
+- HEDGE: usa positionSide LONG/SHORT en entradas y salidas.
 
-Requiere Python 3.10+ y los paquetes de requirements incluidos en el README.
+Requiere Python 3.10+ y python-telegram-bot 22.8 + requests.
 """
 from __future__ import annotations
 
@@ -48,7 +52,7 @@ SESSION = requests.Session()
 
 # ----------------------------- Persistencia ---------------------------------
 DEFAULT_DATA: dict[str, Any] = {
-    "version": 6, "owner_user_id": None, "setup": None,
+    "version": 9, "owner_user_id": None, "setup": None,
     "wizard": {}, "pending": {}, "live_confirm": {}, "last_signal": {}, "trades": {},
 }
 
@@ -84,12 +88,37 @@ def load_data() -> dict[str, Any]:
         return result
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        # v5 corrige las plantillas BUY/SELL separadas del Excel. Las antiguas
-        # listas guardadas como "DEFAULT" se migran a None para resolverlas por lado.
-        if int(raw.get("version", 0) or 0) < 5 and isinstance(raw.get("setup"), dict):
+        old_version = int(raw.get("version", 0) or 0)
+        # v5 corrige las plantillas BUY/SELL separadas del Excel.
+        if old_version < 5 and isinstance(raw.get("setup"), dict):
             raw["setup"]["btc_allocations"] = None
             raw["setup"]["alt_allocations"] = None
-        raw["version"] = 6
+        # v8 fija BTC/ETH a 100x y el bot a Hedge Mode.
+        # v9 añade Stop Loss editable por perfil y restringe altcoins a 20-30x.
+        if isinstance(raw.get("setup"), dict):
+            setup = raw["setup"]
+            setup["btc_leverage"] = 100
+            setup.setdefault("btc_stop_roi_pct", 300.0)
+            setup.setdefault("alt_stop_roi_pct", 120.0)
+            try:
+                old_alt_lev = int(float(setup.get("alt_leverage") or 20))
+            except (TypeError, ValueError):
+                old_alt_lev = 20
+            setup["alt_leverage"] = old_alt_lev if 20 <= old_alt_lev <= 30 else 20
+        if old_version < 8:
+            for uid, wizard in list(raw.get("wizard", {}).items()):
+                if wizard.get("kind") == "setup":
+                    raw["wizard"].pop(uid, None)
+            for trade in raw.get("trades", {}).values():
+                if trade.get("status") in {"ACTIVE", "SUBMITTING"} and trade.get("position_side") not in {"LONG", "SHORT"}:
+                    trade["status"] = "LEGACY_REVIEW"
+                    trade["legacy_review_warning_sent"] = False
+        if old_version < 9:
+            # Los asistentes de configuración antiguos tenían otro número de pasos.
+            for uid, wizard in list(raw.get("wizard", {}).items()):
+                if wizard.get("kind") == "setup":
+                    raw["wizard"].pop(uid, None)
+        raw["version"] = 9
         return merge_defaults(raw, DEFAULT_DATA)
     except Exception as exc:
         backup = DATA_FILE.with_name("trading_bot_data.corrupto.json")
@@ -199,13 +228,15 @@ def asset_class(symbol: str) -> str:
 def default_count_percent_leverage(kind: str, count: int, decimals: int = 3,
                                    direction: str = "BUY") -> tuple[float, float]:
     if kind == "btc_eth":
-        if count == 3: return 8.333, 20
-        if count == 4: return 3.333, 60
+        # El usuario fijó BTC/ETH a 100x. Se conservan los porcentajes de
+        # capital del Excel, pero el apalancamiento predeterminado es 100x.
+        if count == 3: return 8.333, 100
+        if count == 4: return 3.333, 100
         if count == 5: return 2.5, 100
         if count == 6: return (3.333 if direction == "BUY" else 2.5), 100
-        return 3.333, 20
+        return 3.333, 100
     if count == 4:
-        return (3.333, 60) if direction == "BUY" else (8.333, 100)
+        return (3.333, 20) if direction == "BUY" else (8.333, 20)
     if count == 6:
         return 8.333, 20
     if direction == "SELL":
@@ -233,9 +264,12 @@ def resolve_profile(symbol: str, setup: dict[str, Any], direction: str = "BUY") 
     decimals = 3 if kind == "btc_eth" else ALT_DECIMALS.get(base, 3)
     default_pct, default_lev = default_count_percent_leverage(kind, count, decimals, direction)
     pct_override = setup.get("btc_operate") if kind == "btc_eth" else setup.get("alt_operate")
-    lev_override = setup.get("btc_leverage") if kind == "btc_eth" else setup.get("alt_leverage")
+    lev_override = setup.get("alt_leverage") if kind == "altcoin" else None
     operate = float(pct_override) if pct_override is not None else default_pct
-    leverage = float(lev_override) if lev_override is not None else default_lev
+    # BTC/ETH permanecen en 100x; altcoins permiten elegir entre 20x y 30x.
+    leverage = 100.0 if kind == "btc_eth" else (float(lev_override) if lev_override is not None else 20.0)
+    if kind == "altcoin" and (not leverage.is_integer() or not 20 <= leverage <= 30):
+        raise ValueError("El apalancamiento de altcoins debe ser entero y estar entre 20x y 30x.")
     alloc_setting = setup.get("btc_allocations") if kind == "btc_eth" else setup.get("alt_allocations")
     allocs = list(alloc_setting) if alloc_setting else default_weights(kind, count, direction, decimals)
     # En las hojas de 3 entradas la cantidad sigue la clasificación de MONEDAS;
@@ -265,12 +299,22 @@ def resolve_profile(symbol: str, setup: dict[str, Any], direction: str = "BUY") 
         range_fraction, sheet = None, "6 ENT."
     else:
         range_fraction, sheet = None, f"ALTCOIN {count} ENT."
+    # Stop Loss editable por perfil, aplicado igual que en el Excel:
+    # movimiento adverso del precio = ROI de riesgo / leverage / 100.
+    if kind == "btc_eth":
+        stop_roi_pct = float(setup.get("btc_stop_roi_pct", 300.0))
+        if not 1.0 <= stop_roi_pct <= 1000.0:
+            raise ValueError("El Stop Loss BTC/ETH debe estar entre 1% y 1000% ROI.")
+    else:
+        stop_roi_pct = float(setup.get("alt_stop_roi_pct", 120.0))
+        if not 80.0 <= stop_roi_pct <= 120.0:
+            raise ValueError("El Stop Loss de altcoins debe estar entre 80% y 120% ROI.")
     return {
         "kind": kind, "label": "BTC / ETH" if kind == "btc_eth" else "ALTCOIN",
         "sheet": sheet, "count": count, "allocations": allocs,
         "operate_pct": operate, "leverage": leverage,
         "quantity_decimals": qdec, "price_decimals": pdec,
-        "range_fraction": range_fraction,
+        "range_fraction": range_fraction, "stop_roi_pct": stop_roi_pct,
         "margin_type": "CROSSED" if kind == "btc_eth" or (kind == "altcoin" and count in {4, 6}) else "ISOLATED",
         "direction": direction,
     }
@@ -352,8 +396,10 @@ class BinanceUSDM:
         if self.mode not in BINANCE_URLS:
             raise RuntimeError("Entorno Binance inválido: usa DEMO o LIVE.")
         self.base = BINANCE_URLS[self.mode]
-        self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        self.secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        # Credenciales separadas para poder seguir supervisando operaciones DEMO
+        # aunque el usuario cambie el entorno de nuevas señales a LIVE.
+        self.api_key = os.getenv(f"BINANCE_{self.mode}_API_KEY", os.getenv("BINANCE_API_KEY", "")).strip()
+        self.secret = os.getenv(f"BINANCE_{self.mode}_API_SECRET", os.getenv("BINANCE_API_SECRET", "")).strip()
 
     def credentials_ok(self) -> bool:
         return bool(self.api_key and self.secret)
@@ -410,9 +456,42 @@ class BinanceUSDM:
         result = self.request("GET", "/fapi/v1/positionSide/dual", signed=True)
         return bool(result.get("dualSidePosition"))
 
-    def position(self, symbol: str) -> dict[str, Any]:
+    def ensure_hedge_mode(self) -> None:
+        """Activa Hedge Mode si aún no está habilitado.
+
+        Binance puede rechazar el cambio si existe cualquier orden/posición
+        abierta en la cuenta, incluso en otro símbolo. En ese caso se detiene
+        antes de enviar nuevas órdenes.
+        """
+        if self.is_hedge_mode():
+            return
+        try:
+            self.request("POST", "/fapi/v1/positionSide/dual",
+                         {"dualSidePosition": "true"}, signed=True)
+        except RuntimeError as exc:
+            if "-4067" in str(exc) or "-4068" in str(exc):
+                raise RuntimeError(
+                    "Binance no permite activar Hedge Mode porque hay órdenes o posiciones abiertas "
+                    "en algún símbolo de la cuenta. Cancela/cierra esas operaciones, vuelve a intentar "
+                    "y no se enviaron las entradas de esta señal."
+                ) from exc
+            raise
+        if not self.is_hedge_mode():
+            raise RuntimeError("No se pudo confirmar que Binance quedó en Hedge Mode.")
+
+    @staticmethod
+    def position_side(direction: str) -> str:
+        return "LONG" if direction == "BUY" else "SHORT"
+
+    def positions(self, symbol: str) -> list[dict[str, Any]]:
         rows = self.request("GET", "/fapi/v3/positionRisk", {"symbol": symbol}, signed=True)
-        return next((p for p in rows if p.get("symbol") == symbol and p.get("positionSide") == "BOTH"), {})
+        return [p for p in rows if p.get("symbol") == symbol and p.get("positionSide") in {"LONG", "SHORT"}]
+
+    def position(self, symbol: str, direction: str) -> dict[str, Any]:
+        side = self.position_side(direction)
+        rows = self.positions(symbol)
+        return next((p for p in rows if p.get("positionSide") == side),
+                    {"symbol": symbol, "positionSide": side, "positionAmt": "0", "entryPrice": "0"})
 
     def mark_price(self, symbol: str) -> float:
         d = self.request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
@@ -427,11 +506,24 @@ class BinanceUSDM:
         self.request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, signed=True)
 
     def new_limit(self, symbol: str, side: str, qty: float, price: float, client_id: str,
-                  reduce_only: bool = False) -> dict[str, Any]:
+                  position_side: str) -> dict[str, Any]:
+        if position_side not in {"LONG", "SHORT"}:
+            raise ValueError("Hedge Mode requiere positionSide LONG o SHORT.")
+        # Binance no permite enviar reduceOnly en Hedge Mode. La protección
+        # se hace especificando siempre la pata LONG/SHORT correcta.
         return self.request("POST", "/fapi/v1/order", {
             "symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": "GTC",
-            "quantity": api_num(qty), "price": api_num(price), "positionSide": "BOTH",
-            "reduceOnly": "true" if reduce_only else "false", "newClientOrderId": client_id,
+            "quantity": api_num(qty), "price": api_num(price), "positionSide": position_side,
+            "newClientOrderId": client_id, "newOrderRespType": "RESULT",
+        }, signed=True)
+
+    def new_market_close(self, symbol: str, side: str, qty: float, position_side: str,
+                         client_id: str) -> dict[str, Any]:
+        if position_side not in {"LONG", "SHORT"}:
+            raise ValueError("Hedge Mode requiere positionSide LONG o SHORT.")
+        return self.request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": side, "type": "MARKET", "quantity": api_num(qty),
+            "positionSide": position_side, "newClientOrderId": client_id,
             "newOrderRespType": "RESULT",
         }, signed=True)
 
@@ -442,16 +534,31 @@ class BinanceUSDM:
         return self.request("GET", "/fapi/v1/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
 
     def new_trailing(self, symbol: str, side: str, qty: float, activation: float | None,
-                     callback: float, client_id: str) -> dict[str, Any]:
+                     callback: float, client_id: str, position_side: str) -> dict[str, Any]:
+        if position_side not in {"LONG", "SHORT"}:
+            raise ValueError("Hedge Mode requiere positionSide LONG o SHORT.")
         params: dict[str, Any] = {
             "algoType": "CONDITIONAL", "symbol": symbol, "side": side,
             "type": "TRAILING_STOP_MARKET", "quantity": api_num(qty),
-            "positionSide": "BOTH", "reduceOnly": "true", "callbackRate": api_num(callback, 2),
+            "positionSide": position_side, "callbackRate": api_num(callback, 2),
             "workingType": "MARK_PRICE", "clientAlgoId": client_id,
         }
         if activation is not None:
             params["activatePrice"] = api_num(activation)
         return self.request("POST", "/fapi/v1/algoOrder", params, signed=True)
+
+    def new_stop_loss(self, symbol: str, side: str, trigger_price: float,
+                      client_id: str, position_side: str) -> dict[str, Any]:
+        if position_side not in {"LONG", "SHORT"}:
+            raise ValueError("Hedge Mode requiere positionSide LONG o SHORT.")
+        # Close-all STOP_MARKET: en Hedge Mode solo se permite del lado que
+        # cierra la pata (SELL/LONG o BUY/SHORT); sin quantity ni reduceOnly.
+        return self.request("POST", "/fapi/v1/algoOrder", {
+            "algoType": "CONDITIONAL", "symbol": symbol, "side": side,
+            "type": "STOP_MARKET", "positionSide": position_side,
+            "closePosition": "true", "triggerPrice": api_num(trigger_price),
+            "workingType": "MARK_PRICE", "clientAlgoId": client_id,
+        }, signed=True)
 
     def algo_order(self, algo_id: int) -> dict[str, Any]:
         return self.request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id}, signed=True)
@@ -469,6 +576,19 @@ class BinanceUSDM:
 def calc_roi_price(entry_price: float, direction: str, leverage: float, roi_pct: float) -> float:
     move = roi_pct / leverage / 100
     return entry_price * (1 + move) if direction == "BUY" else entry_price * (1 - move)
+
+
+def calc_excel_stop_price(average_entry: float, direction: str, leverage: float,
+                          stop_roi_pct: float) -> float:
+    """Replica la fórmula del Excel desde el promedio ponderado.
+
+    LONG: avg - ((riskROI / leverage) / 100) * avg
+    SHORT: avg + ((riskROI / leverage) / 100) * avg
+    """
+    if average_entry <= 0 or leverage <= 0 or stop_roi_pct <= 0:
+        raise ValueError("No se puede calcular el stop con promedio, leverage o riesgo inválido.")
+    adverse_move = stop_roi_pct / leverage / 100
+    return average_entry * (1 - adverse_move) if direction == "BUY" else average_entry * (1 + adverse_move)
 
 def exit_price_for_fill(trade: dict[str, Any], entry_price: float, kind: str) -> float:
     setup = trade["setup"]
@@ -564,7 +684,8 @@ def process_fill_batch(api: BinanceUSDM, trade: dict[str, Any], qty: float, quot
     if sl.get("tp_qty", 0) and not sl.get("tp_order_id"):
         try:
             order = api.new_limit(trade["symbol"], "SELL" if trade["direction"] == "BUY" else "BUY",
-                                  float(sl["tp_qty"]), float(sl["tp_price"]), sl["tp_client_id"], True)
+                                  float(sl["tp_qty"]), float(sl["tp_price"]), sl["tp_client_id"],
+                                  trade["position_side"])
         except Exception as send_exc:
             try:
                 order = api.order_by_client_id(trade["symbol"], sl["tp_client_id"])
@@ -623,16 +744,25 @@ def _trail_activation(api: BinanceUSDM, trade: dict[str, Any], avg_entry: float,
     activation = value if mode == "PRICE" else calc_roi_price(avg_entry, trade["direction"],
                                                                 float(trade["profile"]["leverage"]), value)
     mark = api.mark_price(trade["symbol"])
+    state = trade.setdefault("trail_order", {})
+    if state.get("activation_reached"):
+        return None
     if trade["direction"] == "BUY":
         if activation <= avg_entry:
             raise ValueError("La activación trailing LONG debe estar por encima del precio medio.")
         activation = quantize_price(activation, rules["tick"], "up")
-        # Si el nivel ya pasó, activar desde el precio vigente.
-        return activation if activation > mark else None
+        # En LONG, al tocar/superar activación se conserva ese estado.
+        if mark >= activation:
+            state["activation_reached"] = True
+            return None
+        return activation
     if activation >= avg_entry:
         raise ValueError("La activación trailing SHORT debe estar por debajo del precio medio.")
     activation = quantize_price(activation, rules["tick"], "down")
-    return activation if activation < mark else None
+    if mark <= activation:
+        state["activation_reached"] = True
+        return None
+    return activation
 
 
 def _cancel_remaining_entries(api: BinanceUSDM, trade: dict[str, Any]) -> None:
@@ -658,7 +788,7 @@ def ensure_aggregated_trailing(api: BinanceUSDM, trade: dict[str, Any]) -> tuple
     # parcial que está viva para evitar solapamientos de reduceOnly.
     if trade.get("pending_exit_slice") or float(trade.get("pending_exit_qty", 0)) > float(trade.get("rules", {}).get("step", "0.00000001")) / 2:
         return notices, False
-    pos = api.position(trade["symbol"])
+    pos = api.position(trade["symbol"], trade["direction"])
     position_qty = abs(float(pos.get("positionAmt", 0) or 0))
     rules = trade["rules"]
     min_qty = float(rules["min_qty"])
@@ -754,7 +884,7 @@ def ensure_aggregated_trailing(api: BinanceUSDM, trade: dict[str, Any]) -> tuple
         return notices, False
 
     # Refrescar posición y órdenes tras una posible cancelación.
-    pos = api.position(trade["symbol"])
+    pos = api.position(trade["symbol"], trade["direction"])
     position_qty = abs(float(pos.get("positionAmt", 0) or 0))
     tp_remaining, more_notices = _tp_open_remaining(api, trade)
     notices.extend(more_notices)
@@ -766,6 +896,12 @@ def ensure_aggregated_trailing(api: BinanceUSDM, trade: dict[str, Any]) -> tuple
     if avg_entry <= 0:
         raise RuntimeError("Binance no devolvió el precio medio de la posición; trailing no enviado.")
     activation = _trail_activation(api, trade, avg_entry, rules)
+    if activation is None:
+        pending_before = any(e.get("status") not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED", "CANCELED_BEFORE_SUBMIT"}
+                             for e in trade.get("entries", []))
+        _cancel_remaining_entries(api, trade)
+        if pending_before:
+            notices.append("🎯 Se alcanzó la activación del trailing. Se cancelaron las recompras pendientes para no aumentar la exposición mientras protege ganancias.")
     state["generation"] = int(state.get("generation", 0)) + 1
     client_id = f"JHT{trade['id'][-8:].upper()}{state['generation']}"[:36]
     state.update({"client_id": client_id, "qty": desired_qty, "activation": activation,
@@ -774,7 +910,8 @@ def ensure_aggregated_trailing(api: BinanceUSDM, trade: dict[str, Any]) -> tuple
     side_exit = "SELL" if trade["direction"] == "BUY" else "BUY"
     try:
         response = api.new_trailing(trade["symbol"], side_exit, desired_qty, activation,
-                                    float(trade["setup"]["callback_rate"]), client_id)
+                                    float(trade["setup"]["callback_rate"]), client_id,
+                                    trade["position_side"])
     except Exception as send_exc:
         try:
             response = api.algo_order_by_client_id(client_id)
@@ -793,6 +930,239 @@ def ensure_aggregated_trailing(api: BinanceUSDM, trade: dict[str, Any]) -> tuple
         f"Retroceso: {trade['setup']['callback_rate']}%"
     )
     return notices, True
+
+
+def cancel_other_exit_orders(api: BinanceUSDM, trade: dict[str, Any]) -> list[str]:
+    """Cancela órdenes de salida hermanas después de dispararse el stop fijo."""
+    notes: list[str] = []
+    _cancel_remaining_entries(api, trade)
+    for sl in trade.get("exit_slices", []):
+        oid = sl.get("tp_order_id")
+        if not oid:
+            continue
+        try:
+            current = api.order(trade["symbol"], int(oid))
+            if current.get("status") not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+                api.cancel_order(trade["symbol"], int(oid))
+            sl["tp_status"] = "CANCELED"
+        except Exception as exc:
+            notes.append(f"⚠️ No se pudo cancelar la toma parcial {oid}: {exc}")
+    trail = trade.get("trail_order", {})
+    aid = trail.get("algo_id")
+    if aid and str(trail.get("status", "")).upper() not in {"FINISHED", "TRIGGERED", "CANCELED", "EXPIRED", "REJECTED"}:
+        try:
+            api.cancel_algo(int(aid))
+            trail["status"] = "CANCELED"
+        except Exception as exc:
+            notes.append(f"⚠️ No se pudo cancelar trailing {aid}: {exc}")
+    save_data()
+    return notes
+
+
+def ensure_fixed_stop_loss(api: BinanceUSDM, trade: dict[str, Any]) -> tuple[list[str], bool]:
+    """Crea/actualiza el STOP_MARKET closePosition según la fórmula del Excel.
+
+    Devuelve (avisos, stop_disparado). El cierre se asocia exclusivamente a
+    positionSide LONG o SHORT, no toca la pata opuesta en Hedge Mode.
+    """
+    notes: list[str] = []
+    state = trade.setdefault("stop_loss_order", {
+        "algo_id": None, "client_id": None, "trigger_price": None,
+        "status": "NONE", "generation": 0,
+    })
+    position = api.position(trade["symbol"], trade["direction"])
+    position_qty = abs(float(position.get("positionAmt", 0) or 0))
+    if position_qty <= 0:
+        # No hay posición de esta pata. Si quedó un stop antiguo activo, cancelarlo.
+        if state.get("algo_id") and str(state.get("status", "")).upper() not in {"FINISHED", "TRIGGERED", "CANCELED", "EXPIRED", "REJECTED"}:
+            try:
+                api.cancel_algo(int(state["algo_id"]))
+            except Exception:
+                pass
+        state["status"] = "NO_POSITION"
+        save_data()
+        return notes, False
+
+    # Recupera una orden MARKET de emergencia si la respuesta se perdió.
+    if not state.get("market_order_id") and state.get("client_id") and state.get("status") == "MARKET_CLOSE_UNKNOWN":
+        try:
+            recovered_market = api.order_by_client_id(trade["symbol"], state["client_id"])
+            state["market_order_id"] = int(recovered_market["orderId"])
+            state["status"] = recovered_market.get("status", "NEW")
+            save_data()
+        except Exception as exc:
+            state["last_error"] = str(exc)
+            save_data()
+            notes.append("🚨 Cierre MARKET de emergencia no confirmado. No se repetirá a ciegas; verifica la pata en Binance.")
+            return notes, True
+
+    if state.get("market_order_id"):
+        try:
+            market_order = api.order(trade["symbol"], int(state["market_order_id"]))
+            market_status = str(market_order.get("status", "NEW")).upper()
+            state["status"] = market_status
+            if market_status in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+                save_data()
+                return notes, True
+            latest_pos = api.position(trade["symbol"], trade["direction"])
+            latest_qty = abs(float(latest_pos.get("positionAmt", 0) or 0))
+            if latest_qty <= 0:
+                save_data()
+                return notes, True
+            # La MARKET anterior terminó pero quedó cantidad residual: se
+            # permite un nuevo cierre por el remanente con client ID distinto.
+            state.pop("market_order_id", None)
+            state["status"] = "MARKET_CLOSE_RETRY"
+            position = latest_pos
+            position_qty = latest_qty
+            save_data()
+        except Exception as exc:
+            state["last_error"] = str(exc)
+            save_data()
+            notes.append(f"🚨 No se pudo verificar el cierre MARKET previo: {exc}")
+            return notes, True
+
+    # Recuperación idempotente si el POST pudo llegar a Binance y se perdió la respuesta.
+    if not state.get("algo_id") and state.get("client_id") and state.get("status") == "SUBMISSION_UNKNOWN":
+        try:
+            recovered = api.algo_order_by_client_id(state["client_id"])
+            state["algo_id"] = int(recovered["algoId"])
+            state["status"] = recovered.get("algoStatus", "NEW")
+            save_data()
+        except Exception as exc:
+            state["last_error"] = str(exc)
+            save_data()
+            notes.append("🚨 No se puede confirmar el stop anterior. No se enviará uno duplicado; revisa Binance.")
+            return notes, True
+
+    if state.get("algo_id"):
+        try:
+            current = api.algo_order(int(state["algo_id"]))
+            status = str(current.get("algoStatus", state.get("status", "NEW"))).upper()
+            state["status"] = status
+            if status in {"TRIGGERED", "FINISHED"}:
+                trade["exit_reason"] = "STOP_LOSS"
+                notes.extend(cancel_other_exit_orders(api, trade))
+                save_data()
+                return notes, True
+            if status not in {"CANCELED", "EXPIRED", "REJECTED"}:
+                pass
+            else:
+                state["algo_id"] = None
+        except Exception as exc:
+            notes.append(f"⚠️ No se pudo consultar el stop existente: {exc}")
+            return notes, True
+
+    avg_entry = float(position.get("entryPrice", 0) or position.get("breakEvenPrice", 0) or 0)
+    if avg_entry <= 0:
+        notes.append("🚨 Binance no devolvió el precio promedio para actualizar el stop.")
+        return notes, True
+    prof = trade["profile"]
+    stop_roi_pct = float(prof["stop_roi_pct"])
+    leverage = float(prof["leverage"])
+    raw_trigger = calc_excel_stop_price(avg_entry, trade["direction"], leverage, stop_roi_pct)
+    tick = trade["rules"]["tick"]
+    trigger = quantize_price(raw_trigger, tick, "up" if trade["direction"] == "BUY" else "down")
+    mark = api.mark_price(trade["symbol"])
+
+    # El movimiento adverso es stop_roi_pct / leverage / 100.
+    # Por ejemplo, BTC/ETH 300% a 100x = 3%; altcoin 80% a 20x = 4%.
+    # La liquidación depende del margen disponible y del maintenance tier; si
+    # Binance reporta una liquidación antes del stop, avisar claramente.
+    liq_price = float(position.get("liquidationPrice", 0) or 0)
+    stop_behind_liquidation = bool(
+        liq_price > 0 and (
+            (trade["direction"] == "BUY" and trigger <= liq_price) or
+            (trade["direction"] == "SELL" and trigger >= liq_price)
+        )
+    )
+    if stop_behind_liquidation and not state.get("liquidation_warning_sent"):
+        notes.append(
+            f"🚨 ALERTA DE LIQUIDACIÓN {trade['display_symbol']} ({trade['position_side']})\n"
+            f"Precio de liquidación informado por Binance: {fmt(liq_price,8)}\n"
+            f"Stop del Excel: {fmt(trigger,8)}. El stop queda más allá del precio de liquidación; Binance podría liquidar antes de que se ejecute el STOP_MARKET. Revisa margen, tamaño y precio de liquidación inmediatamente."
+        )
+        state["liquidation_warning_sent"] = True
+    elif not stop_behind_liquidation:
+        state["liquidation_warning_sent"] = False
+
+    # Si el precio ya cruzó el stop antes de poder crear la protección,
+    # liquidar únicamente esta pata Hedge con una MARKET idempotente.
+    crossed = (mark <= trigger) if trade["direction"] == "BUY" else (mark >= trigger)
+    if crossed:
+        _cancel_remaining_entries(api, trade)
+        notes.extend(cancel_other_exit_orders(api, trade))
+        generation = int(state.get("generation", 0)) + 1
+        cid = f"JSLM{trade['id'][-8:].upper()}{generation}"[:36]
+        state.update({"client_id": cid, "status": "MARKET_CLOSE_UNKNOWN", "generation": generation,
+                      "trigger_price": trigger})
+        save_data()
+        try:
+            response = api.new_market_close(
+                trade["symbol"], "SELL" if trade["direction"] == "BUY" else "BUY",
+                floor_step(position_qty, trade["rules"]["step"]), trade["position_side"], cid)
+        except Exception as send_exc:
+            try:
+                response = api.order_by_client_id(trade["symbol"], cid)
+            except Exception:
+                state["last_error"] = str(send_exc)
+                save_data()
+                notes.append(f"🚨 El precio ya atravesó el stop ({fmt(trigger,8)}), pero no se pudo confirmar el cierre MARKET: {send_exc}")
+                return notes, True
+        state["market_order_id"] = int(response["orderId"])
+        state["status"] = response.get("status", "NEW")
+        trade["exit_reason"] = "STOP_LOSS_MARKET"
+        save_data()
+        notes.append(f"🛑 El precio ya había atravesado el stop {fmt(trigger,8)}. Se envió MARKET para cerrar {trade['position_side']}.")
+        return notes, True
+
+    old_trigger = state.get("trigger_price")
+    if state.get("algo_id") and state.get("status") not in {"CANCELED", "EXPIRED", "REJECTED", "NO_POSITION"}:
+        same = old_trigger is not None and abs(float(old_trigger) - trigger) < float(tick) / 2
+        if same:
+            return notes, False
+        # El promedio cambió por un nuevo fill. Reemplazar el stop close-all.
+        try:
+            api.cancel_algo(int(state["algo_id"]))
+        except Exception as exc:
+            fresh = api.algo_order(int(state["algo_id"]))
+            fresh_status = str(fresh.get("algoStatus", "")).upper()
+            if fresh_status in {"TRIGGERED", "FINISHED"}:
+                trade["exit_reason"] = "STOP_LOSS"
+                notes.extend(cancel_other_exit_orders(api, trade))
+                return notes, True
+            if fresh_status not in {"CANCELED", "EXPIRED", "REJECTED"}:
+                raise RuntimeError(f"No se pudo reemplazar el stop anterior: {exc}")
+        state["status"] = "CANCELED"
+        state["algo_id"] = None
+        save_data()
+
+    generation = int(state.get("generation", 0)) + 1
+    cid = f"JSL{trade['id'][-8:].upper()}{generation}"[:36]
+    side_exit = "SELL" if trade["direction"] == "BUY" else "BUY"
+    state.update({"client_id": cid, "trigger_price": trigger, "generation": generation,
+                  "status": "SUBMISSION_UNKNOWN", "algo_id": None,
+                  "stop_roi_pct": stop_roi_pct, "leverage": leverage, "avg_entry": avg_entry})
+    save_data()
+    try:
+        response = api.new_stop_loss(trade["symbol"], side_exit, trigger, cid, trade["position_side"])
+    except Exception as send_exc:
+        try:
+            response = api.algo_order_by_client_id(cid)
+        except Exception:
+            state["last_error"] = str(send_exc)
+            save_data()
+            raise RuntimeError(f"No se pudo confirmar el STOP_MARKET: {send_exc}") from send_exc
+    state["algo_id"] = int(response["algoId"])
+    state["status"] = response.get("algoStatus", "NEW")
+    state.pop("last_error", None)
+    save_data()
+    notes.append(
+        f"🛑 Stop Loss {trade['display_symbol']} ({trade['position_side']})\n"
+        f"Promedio real: {fmt(avg_entry,8)} | Riesgo Excel: {stop_roi_pct:g}% ROI / {leverage:g}x\n"
+        f"Movimiento adverso: {stop_roi_pct/leverage:.4f}% | Activación: {fmt(trigger,8)}"
+    )
+    return notes, False
 
 # -------------------------------- Telegram -----------------------------------
 def allowed(update: Update) -> bool:
@@ -841,27 +1211,28 @@ def live_confirmation_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Cancelar", callback_data="cancel_live_execute")],
     ])
 
-SETUP_STEPS = ["capital", "btc_count", "btc_operate", "btc_leverage", "btc_alloc",
-               "alt_count", "alt_operate", "alt_leverage", "alt_alloc",
+SETUP_STEPS = ["capital", "btc_count", "btc_operate", "btc_stop_roi_pct", "btc_alloc",
+               "alt_count", "alt_operate", "alt_leverage", "alt_stop_roi_pct", "alt_alloc",
                "partial_pct", "tp_mode", "tp_value", "trail_mode", "trail_value", "callback_rate"]
 
 def wizard_prompt(step: str) -> str:
     prompts = {
-        "capital": "Configuración 1/15 — Capital total disponible en USDT. Ejemplo: 1000",
-        "btc_count": "2/15 — Entradas BTC/ETH (1 a 20). Recomendación Excel: 3, 4, 5 o 6.",
-        "btc_operate": "3/15 — % del capital destinado por operación BTC/ETH. Escribe DEFAULT para usar el valor de Excel según la plantilla.",
-        "btc_leverage": "4/15 — Apalancamiento BTC/ETH. Escribe DEFAULT para usar el del Excel.",
-        "btc_alloc": "5/15 — Porcentajes de cada entrada BTC/ETH separados por coma y sumando 100, o DEFAULT para distribución Excel.",
-        "alt_count": "6/15 — Entradas para ALTCOINS (1 a 20). Recomendación Excel: 3, 4 o 6.",
-        "alt_operate": "7/15 — % de capital por operación ALTCOINS. DEFAULT conserva los valores distintos de las hojas 0/1/2/3 DEC y 4/6 entradas.",
-        "alt_leverage": "8/15 — Apalancamiento ALTCOINS. DEFAULT usa el correspondiente a la plantilla Excel.",
-        "alt_alloc": "9/15 — Porcentajes de entradas ALTCOINS, separados por coma y sumando 100, o DEFAULT.",
-        "partial_pct": "10/15 — ¿Qué porcentaje del tamaño ejecutado tomará la orden límite parcial? Ejemplo: 50",
-        "tp_mode": "11/15 — ¿La toma parcial se define por PRECIO o por ROI? Escribe PRECIO o ROI.",
-        "tp_value": "12/15 — Valor de la toma parcial: precio exacto USDT o ROI % según elegiste.",
-        "trail_mode": "13/15 — ¿La activación del trailing se define por PRECIO o por ROI? Escribe PRECIO o ROI.",
-        "trail_value": "14/15 — Valor de activación del trailing: precio exacto o ROI % según elegiste.",
-        "callback_rate": "15/15 — Retroceso del trailing en % (USDⓈ-M admite 0.1 a 20). Ejemplo: 1",
+        "capital": "Configuración 1/16 — Capital total disponible en USDT. Ejemplo: 1000",
+        "btc_count": "2/16 — Entradas BTC/ETH (1 a 20). Recomendación Excel: 3, 4, 5 o 6.",
+        "btc_operate": "3/16 — % del capital destinado por operación BTC/ETH. Escribe DEFAULT para usar el valor de Excel según la plantilla.",
+        "btc_stop_roi_pct": "4/16 — Stop Loss BTC/ETH en ROI negativo. Escribe el valor positivo que representa el riesgo (300 = −300% ROI). DEFAULT = 300.",
+        "btc_alloc": "5/16 — Porcentajes de cada entrada BTC/ETH separados por coma y sumando 100, o DEFAULT para distribución Excel.",
+        "alt_count": "6/16 — Entradas para ALTCOINS (1 a 20). Recomendación Excel: 3, 4 o 6.",
+        "alt_operate": "7/16 — % de capital por operación ALTCOINS. DEFAULT conserva los valores por plantilla Excel.",
+        "alt_leverage": "8/16 — Apalancamiento ALTCOINS: elige un entero entre 20x y 30x. DEFAULT = 20x.",
+        "alt_stop_roi_pct": "9/16 — Stop Loss ALTCOINS en ROI negativo: elige entre 80% y 120%. Ejemplo: 100 = −100% ROI. DEFAULT = 120.",
+        "alt_alloc": "10/16 — Porcentajes de entradas ALTCOINS, separados por coma y sumando 100, o DEFAULT.",
+        "partial_pct": "11/16 — ¿Qué porcentaje del tamaño ejecutado tomará la orden límite parcial? Ejemplo: 50",
+        "tp_mode": "12/16 — ¿La toma parcial se define por PRECIO o por ROI? Escribe PRECIO o ROI.",
+        "tp_value": "13/16 — Valor de la toma parcial: precio exacto USDT o ROI % según elegiste.",
+        "trail_mode": "14/16 — ¿La activación del trailing se define por PRECIO o por ROI? Escribe PRECIO o ROI.",
+        "trail_value": "15/16 — Valor de activación del trailing: precio exacto o ROI % según elegiste.",
+        "callback_rate": "16/16 — Retroceso del trailing en % (Binance USDⓈ-M admite 0.1 a 20). Ejemplo: 1",
     }
     return prompts[step]
 
@@ -908,13 +1279,28 @@ async def consume_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             v = int(text)
             if not 1 <= v <= MAX_ENTRIES: raise ValueError("Usa un número entre 1 y 20.")
             vals[step] = v
-        elif step.endswith("operate") or step.endswith("leverage"):
+        elif step.endswith("operate"):
             if text.upper() == "DEFAULT": vals[step] = None
             else:
                 v = parse_num(text)
-                if v <= 0 or (step.endswith("operate") and v > 100) or (step.endswith("leverage") and (v > 125 or not v.is_integer())):
-                    raise ValueError("Porcentaje: >0 y <=100. Apalancamiento: entero entre 1 y 125.")
-                vals[step] = int(v) if step.endswith("leverage") else v
+                if not 0 < v <= 100:
+                    raise ValueError("El porcentaje debe ser mayor que 0 y no superar 100.")
+                vals[step] = v
+        elif step == "alt_leverage":
+            v = 20.0 if text.upper() == "DEFAULT" else parse_num(text)
+            if not v.is_integer() or not 20 <= v <= 30:
+                raise ValueError("Para altcoins el apalancamiento debe ser un entero entre 20x y 30x.")
+            vals[step] = int(v)
+        elif step == "btc_stop_roi_pct":
+            v = 300.0 if text.upper() == "DEFAULT" else parse_num(text)
+            if not 1 <= v <= 1000:
+                raise ValueError("El riesgo ROI BTC/ETH debe estar entre 1% y 1000%. Ejemplo: 300.")
+            vals[step] = v
+        elif step == "alt_stop_roi_pct":
+            v = 120.0 if text.upper() == "DEFAULT" else parse_num(text)
+            if not 80 <= v <= 120:
+                raise ValueError("El Stop Loss de altcoins debe estar entre 80% y 120% ROI.")
+            vals[step] = v
         elif step.endswith("alloc"):
             count = vals["btc_count"] if step == "btc_alloc" else vals["alt_count"]
             kind = "btc_eth" if step == "btc_alloc" else "altcoin"
@@ -975,9 +1361,11 @@ async def consume_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     DATA["setup"] = {
         "complete": True, "capital": vals["capital"],
         "btc_count": vals["btc_count"], "btc_operate": vals["btc_operate"],
-        "btc_leverage": vals["btc_leverage"], "btc_allocations": vals["btc_alloc"],
+        "btc_leverage": 100, "btc_stop_roi_pct": vals["btc_stop_roi_pct"],
+        "btc_allocations": vals["btc_alloc"],
         "alt_count": vals["alt_count"], "alt_operate": vals["alt_operate"],
-        "alt_leverage": vals["alt_leverage"], "alt_allocations": vals["alt_alloc"],
+        "alt_leverage": vals["alt_leverage"], "alt_stop_roi_pct": vals["alt_stop_roi_pct"],
+        "alt_allocations": vals["alt_alloc"],
         "partial_pct": vals["partial_pct"], "tp_mode": vals["tp_mode"], "tp_value": vals["tp_value"],
         "trail_mode": vals["trail_mode"], "trail_value": vals["trail_value"],
         "callback_rate": vals["callback_rate"],
@@ -988,8 +1376,11 @@ async def consume_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return True
 
 def setup_summary(s: dict[str, Any]) -> str:
-    return (f"Capital: {s['capital']} USDT\nBTC/ETH: {s['btc_count']} entradas | % operar: {s['btc_operate'] if s['btc_operate'] is not None else 'Excel'} | leverage: {s['btc_leverage'] if s['btc_leverage'] is not None else 'Excel'} | distribución: {'Excel por dirección' if not s.get('btc_allocations') else 'personalizada'}\n"
-            f"Altcoins: {s['alt_count']} entradas | % operar: {s['alt_operate'] if s['alt_operate'] is not None else 'Excel'} | leverage: {s['alt_leverage'] if s['alt_leverage'] is not None else 'Excel'} | distribución: {'Excel por dirección' if not s.get('alt_allocations') else 'personalizada'}\n"
+    btc_stop = float(s.get("btc_stop_roi_pct", 300.0))
+    alt_stop = float(s.get("alt_stop_roi_pct", 120.0))
+    alt_lev = int(s.get("alt_leverage") or 20)
+    return (f"Capital: {s['capital']} USDT\nBTC/ETH: {s['btc_count']} entradas | % operar: {s['btc_operate'] if s['btc_operate'] is not None else 'Excel'} | leverage: 100x | Stop: -{btc_stop:g}% ROI = {btc_stop/100:.4g}% de movimiento del precio | distribución: {'Excel por dirección' if not s.get('btc_allocations') else 'personalizada'}\n"
+            f"Altcoins: {s['alt_count']} entradas | % operar: {s['alt_operate'] if s['alt_operate'] is not None else 'Excel'} | leverage: {alt_lev}x | Stop: -{alt_stop:g}% ROI = {alt_stop/alt_lev:.4g}% de movimiento del precio | distribución: {'Excel por dirección' if not s.get('alt_allocations') else 'personalizada'}\n"
             f"Toma parcial: {s['partial_pct']}% por {s['tp_mode']} {s['tp_value']}\nTrailing: activación {s['trail_mode']} {s['trail_value']} | retroceso {s['callback_rate']}%")
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1014,7 +1405,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Reenvía un mensaje que contenga un par USDT, BUY/SELL y Rango.\n"
         "Solo se extraen símbolo, dirección y rango. TP, SL y leverage de la señal se ignoran.\n"
-        f"Entorno configurado: {mode_label()}. En LIVE se exige confirmación adicional en Telegram. La protección de salida implementada es toma parcial LIMIT + trailing; no se lee TP ni SL del mensaje.", reply_markup=menu_kb())
+        f"Entorno configurado: {mode_label()}. En LIVE se exige confirmación adicional en Telegram. La señal aporta solo símbolo, dirección y rango; ignora sus TP/SL/leverage. El bot trabaja en Hedge Mode, configura STOP_MARKET según perfil y gestiona toma parcial LIMIT + trailing.", reply_markup=menu_kb())
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -1161,35 +1552,68 @@ def format_plan(signal: dict[str, Any], plan: dict[str, Any], setup: dict[str, A
              f"Distribución: {', '.join(f'{x:g}%' for x in p['allocations'])}", "", "ENTRADAS LIMIT PLANIFICADAS"]
     for e in plan["entries"]:
         lines.append(f"{e['number']:02d}. {fmt(e['price'], p['price_decimals'])} | {e['weight']:g}% | margen {e['margin']:.6f} | qty Excel {fmt(e['quantity_excel'], p['quantity_decimals'])}")
+    estimated_stop = calc_excel_stop_price(plan["average_price"], signal["direction"],
+                                           p["leverage"], p["stop_roi_pct"])
+    adverse_pct = p["stop_roi_pct"] / p["leverage"]
     lines += ["", f"Promedio ponderado estimado: {fmt(plan['average_price'], p['price_decimals'])}",
+              f"Stop Loss CONFIGURABLE: -{p['stop_roi_pct']:g}% ROI / {p['leverage']:g}x = {adverse_pct:.4f}% adverso | precio aprox. {fmt(estimated_stop, p['price_decimals'])}",
+              ("⚠️ El Stop Loss se calcula desde el promedio real de la pata. La liquidación depende del margen y del tramo de mantenimiento; el bot avisará si Binance informa que la liquidación está antes del stop."),
               f"Toma parcial: {setup['partial_pct']}% por {setup['tp_mode']} {setup['tp_value']}",
               f"Trailing: activar por {setup['trail_mode']} {setup['trail_value']} | callback {setup['callback_rate']}%",
-              "", "Los TP/SL/leverage del mensaje no se usan. No se coloca un SL fijo independiente en esta versión.",
-              f"La toma parcial LIMIT se coloca tras cada fill confirmado; el trailing agregado cubre el resto. Entorno: {mode_label()}."]
+              "", "Los TP/SL/leverage del mensaje de Telegram se ignoran.",
+              f"La toma parcial LIMIT se coloca tras cada fill; STOP_MARKET protege toda la pata y el trailing agregado protege el remanente. Modo de posición: HEDGE ({'LONG' if signal['direction']=='BUY' else 'SHORT'}). Entorno: {mode_label()}."]
     return "\n".join(lines)
 
 # ---------------------------- Envío de órdenes -------------------------------
 def submit_trade(signal: dict[str, Any], plan: dict[str, Any], setup: dict[str, Any], chat_id: int) -> dict[str, Any]:
     api = BinanceUSDM()
     if not api.credentials_ok():
-        raise RuntimeError(f"Configura BINANCE_API_KEY y BINANCE_API_SECRET de Binance Futures {api.mode} en .env.")
+        raise RuntimeError(f"Configura BINANCE_{api.mode}_API_KEY y BINANCE_{api.mode}_API_SECRET de Binance Futures {api.mode} en .env.")
     symbol = signal["symbol"]
     validate_exit_settings(plan, setup)
     rules = api.symbol_rules(symbol)
-    if api.is_hedge_mode():
-        raise RuntimeError(f"Tu cuenta está en Hedge Mode. Este bot usa One-way Mode (positionSide BOTH). Cambia a One-way en Binance {api.mode} y vuelve a intentar.")
-    pos = api.position(symbol)
-    if abs(float(pos.get("positionAmt", 0))) > 0:
-        raise RuntimeError(f"Ya existe una posición abierta en {symbol}. No se enviaron órdenes para evitar mezclar operaciones.")
-    open_orders = api.request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+    # Enforzar Hedge Mode (dualSidePosition=true). El cambio es de cuenta:
+    # Binance exige no tener órdenes ni posiciones abiertas en ningún símbolo.
+    api.ensure_hedge_mode()
+    position_side = api.position_side(signal["direction"])
+    same_leg_pos = api.position(symbol, signal["direction"])
+    if abs(float(same_leg_pos.get("positionAmt", 0) or 0)) > 0:
+        raise RuntimeError(f"Ya existe una posición {position_side} abierta en {symbol}. El bot no mezclará dos operaciones de la misma pata.")
+    open_orders_all = api.request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+    open_orders = [o for o in open_orders_all if o.get("positionSide") == position_side]
     if open_orders:
-        raise RuntimeError(f"Ya existen órdenes LIMIT/STOP abiertas para {symbol}. Cancélalas o gestiona esa operación antes de continuar.")
-    open_algo = api.request("GET", "/fapi/v1/openAlgoOrders", {"algoType": "CONDITIONAL", "symbol": symbol}, signed=True)
+        raise RuntimeError(f"Ya existen órdenes abiertas de la pata {position_side} en {symbol}. El bot no las mezclará con esta operación.")
+    open_algo_all = api.request("GET", "/fapi/v1/openAlgoOrders", {"algoType": "CONDITIONAL", "symbol": symbol}, signed=True)
+    open_algo = [o for o in open_algo_all if o.get("positionSide") == position_side]
     if open_algo:
-        raise RuntimeError(f"Ya existen órdenes condicionales/trailing abiertas para {symbol}. Revísalas en Binance {api.mode} antes de continuar.")
+        raise RuntimeError(f"Ya existen órdenes condicionales/trailing de la pata {position_side} en {symbol}. Revísalas antes de continuar.")
 
     profile = plan["profile"]
-    api.set_symbol_settings(symbol, profile["margin_type"], int(round(profile["leverage"])))
+    all_symbol_positions = api.positions(symbol)
+    opposite_side = "SHORT" if position_side == "LONG" else "LONG"
+    opposite_pos = next((x for x in all_symbol_positions if x.get("positionSide") == opposite_side), {})
+    opposite_qty = abs(float(opposite_pos.get("positionAmt", 0) or 0))
+    opposite_orders = [o for o in open_orders_all if o.get("positionSide") == opposite_side]
+    opposite_algos = [o for o in open_algo_all if o.get("positionSide") == opposite_side]
+    if opposite_qty <= 0 and (opposite_orders or opposite_algos):
+        raise RuntimeError(
+            f"Hay órdenes pendientes de la pata opuesta {opposite_side} en {symbol}, pero no una posición que permita validar sus ajustes. "
+            "No cambiaré el apalancamiento/margen compartido del símbolo mientras esas órdenes existan."
+        )
+    if opposite_qty > 0:
+        # El leverage/margin type es configuración del símbolo compartida por
+        # ambas patas. No modificarlo si ya existe la posición opuesta.
+        live_lev = int(float(opposite_pos.get("leverage", profile["leverage"])))
+        margin_raw = str(opposite_pos.get("marginType", profile["margin_type"])).upper()
+        live_margin = "CROSSED" if margin_raw in {"CROSS", "CROSSED"} else "ISOLATED" if margin_raw == "ISOLATED" else margin_raw
+        if live_lev != int(round(profile["leverage"])) or live_margin != str(profile["margin_type"]).upper():
+            raise RuntimeError(
+                f"Ya existe {opposite_side} en {symbol} con {live_lev}x/{live_margin}. "
+                f"El perfil de esta señal requiere {int(round(profile['leverage']))}x/{profile['margin_type']}. "
+                "No cambiaré ajustes compartidos mientras la pata opuesta esté abierta."
+            )
+    else:
+        api.set_symbol_settings(symbol, profile["margin_type"], int(round(profile["leverage"])))
     account = api.account()
     if account.get("canTrade") is False:
         raise RuntimeError(f"La cuenta Binance {api.mode} no tiene habilitado el permiso de trading de Futures.")
@@ -1217,7 +1641,8 @@ def submit_trade(signal: dict[str, Any], plan: dict[str, Any], setup: dict[str, 
     trade_id = hashlib.sha1(f"{symbol}-{time.time_ns()}".encode()).hexdigest()[:12]
     trade = {
         "id": trade_id, "environment": api.mode, "symbol": symbol, "display_symbol": signal["display_symbol"],
-        "direction": signal["direction"], "chat_id": chat_id, "status": "ACTIVE",
+        "direction": signal["direction"], "position_side": position_side,
+        "chat_id": chat_id, "status": "ACTIVE",
         "created_at": int(time.time()), "setup": copy.deepcopy(setup), "profile": profile,
         "rules": rules, "entries": entries, "exit_slices": [],
         "pending_exit_qty": 0.0, "pending_exit_quote": 0.0,
@@ -1237,7 +1662,7 @@ def submit_trade(signal: dict[str, Any], plan: dict[str, Any], setup: dict[str, 
             entry["status"] = "SUBMISSION_UNKNOWN"
             save_data()  # el client ID queda guardado antes del POST
             try:
-                res = api.new_limit(symbol, side, entry["quantity"], entry["price"], cid, False)
+                res = api.new_limit(symbol, side, entry["quantity"], entry["price"], cid, position_side)
             except Exception as send_exc:
                 try:
                     res = api.order_by_client_id(symbol, cid)
@@ -1276,14 +1701,17 @@ def execution_summary(trade: dict[str, Any]) -> str:
     return (f"✅ ENTRADAS ENVIADAS A BINANCE USDⓈ-M FUTURES — {label}\n{trade['display_symbol']} | {'LONG' if trade['direction']=='BUY' else 'SHORT'}\n"
             f"Órdenes límite: {len(trade['entries'])}\nMargen estimado: {sum(x['margin'] for x in trade['entries']):.4f} USDT\n"
             f"Las LIMIT parciales cubren {trade['setup']['partial_pct']}% de cada bloque ejecutado; un único trailing agregado protege el resto.\n"
-            "Las LIMIT parciales y el trailing se colocan al confirmarse los fills. No se coloca SL fijo independiente. Mantén el programa encendido.")
+            f"STOP_MARKET según Excel: -{trade['profile']['stop_roi_pct']:g}% ROI / {trade['profile']['leverage']:g}x, pata {trade['position_side']}.\n"
+            "Modo de posición: HEDGE. Mantén el programa encendido para supervisar fills y salidas.")
 
 def binance_status() -> str:
     mode = configured_binance_mode()
     api = BinanceUSDM(mode)
     acc = api.account()
     usdt = next((a for a in acc.get("assets", []) if a.get("asset") == "USDT"), {})
+    hedge = api.is_hedge_mode()
     return (f"🔌 BINANCE USDⓈ-M FUTURES — {mode_label(mode)}\nConexión autenticada: OK\n"
+            f"Modo de posición: {'HEDGE' if hedge else 'ONE-WAY (el bot lo cambiará a HEDGE al ejecutar, si Binance lo permite)'}\n"
             f"Wallet USDT: {usdt.get('walletBalance', '0')}\nDisponible: {acc.get('availableBalance', '0')} USDT\n"
             + ("⚠️ Producción habilitada: las órdenes pueden usar fondos reales." if mode == "LIVE" else "No se envían órdenes reales desde este entorno."))
 
@@ -1348,22 +1776,36 @@ def monitor_trade_once(trade: dict[str, Any]) -> list[str]:
                 notices.append(f"🚨 No se pudo proteger un fill de {symbol}: {exc}. Revisa la operación en Binance {trade.get('environment', 'DEMO')}.")
                 trade["pending_exit_warning_sent"] = True
 
-    # Actualiza estados de las LIMIT parciales y mantiene UN solo trailing agregado.
+    # Protege la pata con el stop fijo del Excel; después mantiene el trailing
+    # para el remanente parcial, ambos en la misma posición LONG/SHORT.
+    stop_fired = False
     try:
-        trail_notes, trail_present = ensure_aggregated_trailing(api, trade)
-        notices.extend(trail_notes)
-        trade["trailing_present"] = trail_present
-        trade["pending_exit_warning_sent"] = False
+        stop_notes, stop_fired = ensure_fixed_stop_loss(api, trade)
+        notices.extend(stop_notes)
+        trade["stop_loss_present"] = not stop_fired
+        trade["stop_loss_warning_sent"] = False
     except Exception as exc:
-        LOG.exception("No se pudo ajustar el trailing agregado para %s", symbol)
-        if not trade.get("trailing_warning_sent"):
-            notices.append(f"🚨 No se pudo actualizar el trailing de {symbol}: {exc}. Revisa la posición en Binance {trade.get('environment', 'DEMO')}.")
-            trade["trailing_warning_sent"] = True
+        LOG.exception("No se pudo ajustar el Stop Loss de %s", symbol)
+        if not trade.get("stop_loss_warning_sent"):
+            notices.append(f"🚨 No se pudo actualizar el STOP LOSS de {symbol}: {exc}. Revisa Binance {trade.get('environment', 'DEMO')} inmediatamente.")
+            trade["stop_loss_warning_sent"] = True
 
-    # Consulta posición neta. Si quedó en cero tras una salida, cancela también
-    # recompras que sigan pendientes para evitar reabrir una operación cerrada.
+    if not stop_fired:
+        try:
+            trail_notes, trail_present = ensure_aggregated_trailing(api, trade)
+            notices.extend(trail_notes)
+            trade["trailing_present"] = trail_present
+            trade["pending_exit_warning_sent"] = False
+        except Exception as exc:
+            LOG.exception("No se pudo ajustar el trailing agregado para %s", symbol)
+            if not trade.get("trailing_warning_sent"):
+                notices.append(f"🚨 No se pudo actualizar el trailing de {symbol}: {exc}. Revisa la posición en Binance {trade.get('environment', 'DEMO')}.")
+                trade["trailing_warning_sent"] = True
+
+    # Consulta exclusivamente la pata de esta operación; la posición opuesta
+    # del mismo símbolo permanece independiente en Hedge Mode.
     try:
-        pos = api.position(symbol)
+        pos = api.position(symbol, trade["direction"])
         position_qty = abs(float(pos.get("positionAmt", 0)))
     except Exception as exc:
         LOG.warning("Consulta posición %s: %s", symbol, exc)
@@ -1371,7 +1813,8 @@ def monitor_trade_once(trade: dict[str, Any]) -> list[str]:
     entries_terminal = all(e.get("status") in {"FILLED", "CANCELED", "EXPIRED", "REJECTED", "CANCELED_BEFORE_SUBMIT"}
                            for e in trade["entries"])
     has_exit = (any(sl.get("tp_status") == "FILLED" for sl in trade.get("exit_slices", [])) or
-                str(trade.get("trail_order", {}).get("status", "")).upper() in {"TRIGGERED", "FINISHED"})
+                str(trade.get("trail_order", {}).get("status", "")).upper() in {"TRIGGERED", "FINISHED"} or
+                str(trade.get("stop_loss_order", {}).get("status", "")).upper() in {"TRIGGERED", "FINISHED", "MARKET_CLOSE_UNKNOWN"})
     has_fill = any(float(e.get("processed_qty", 0)) > 0 for e in trade["entries"])
     if position_qty == 0 and trade.get("pending_exit_qty", 0) == 0 and (entries_terminal or has_exit or has_fill):
         if has_exit or has_fill:
@@ -1393,6 +1836,11 @@ def monitor_trade_once(trade: dict[str, Any]) -> list[str]:
                 try: api.cancel_algo(int(trail_state["algo_id"]))
                 except Exception: pass
                 trail_state["status"] = "CANCELED"
+            stop_state = trade.get("stop_loss_order", {})
+            if stop_state.get("algo_id") and stop_state.get("status") not in {"FINISHED", "TRIGGERED", "CANCELED", "EXPIRED", "REJECTED"}:
+                try: api.cancel_algo(int(stop_state["algo_id"]))
+                except Exception: pass
+                stop_state["status"] = "CANCELED"
         trade["status"] = "CLOSED"
         notices.append(f"✅ Operación {trade['display_symbol']} cerrada. Se verificó posición cero.")
     save_data()
@@ -1418,9 +1866,12 @@ async def monitor_loop(app: Application) -> None:
 
 def status_text() -> str:
     trades = [t for t in DATA.get("trades", {}).values() if t.get("status") == "ACTIVE"]
-    if not trades:
+    legacy = [t for t in DATA.get("trades", {}).values() if t.get("status") == "LEGACY_REVIEW"]
+    if not trades and not legacy:
         return "📈 No hay operaciones activas administradas por el bot."
     out = ["📈 OPERACIONES ACTIVAS"]
+    for t in legacy:
+        out.append(f"🚨 REVISIÓN MANUAL: {t.get('display_symbol', t.get('symbol','?'))} — no supervisada por versión Hedge")
     for t in trades:
         filled = sum(float(e.get("processed_qty", 0)) for e in t["entries"])
         out.append(f"{t['display_symbol']} {'LONG' if t['direction']=='BUY' else 'SHORT'} | {t.get('environment','DEMO')} | fills {fmt(filled,8)} | órdenes {len(t['entries'])} | salidas {len(t['exit_slices'])}")
@@ -1428,6 +1879,19 @@ def status_text() -> str:
 
 # --------------------------------- Main --------------------------------------
 async def post_init(app: Application) -> None:
+    # Alertar sobre operaciones guardadas por versiones antiguas One-way.
+    for trade in DATA.get("trades", {}).values():
+        if trade.get("status") == "LEGACY_REVIEW" and not trade.get("legacy_review_warning_sent"):
+            warning = (
+                f"🚨 OPERACIÓN ANTIGUA REQUIERE REVISIÓN MANUAL: {trade.get('display_symbol', trade.get('symbol','?'))}. "
+                "Fue creada por una versión anterior sin positionSide LONG/SHORT. Esta versión Hedge no la supervisará. "
+                "Verifica y gestiona esa posición y sus órdenes directamente en Binance antes de abrir operaciones nuevas."
+            )
+            try:
+                await app.bot.send_message(int(trade["chat_id"]), warning)
+                trade["legacy_review_warning_sent"] = True
+            except Exception:
+                LOG.exception("No se pudo notificar operación antigua")
     # Recuperación tras un cierre inesperado durante el envío del grid.
     for trade in DATA.get("trades", {}).values():
         if trade.get("status") == "SUBMITTING":
@@ -1465,7 +1929,7 @@ def main() -> None:
     mode = configured_binance_mode()
     if mode == "LIVE" and not live_trading_allowed():
         print("AVISO: BINANCE_ENV=LIVE pero ALLOW_LIVE_TRADING no es YES; no se enviarán órdenes.")
-    print(f"Trading bot iniciado — Binance USDⓈ-M Futures {mode_label(mode)}")
+    print(f"Trading bot iniciado — Binance USDⓈ-M Futures {mode_label(mode)} — Hedge Mode")
     app.run_polling(drop_pending_updates=False)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
